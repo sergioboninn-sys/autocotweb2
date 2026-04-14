@@ -4,20 +4,29 @@ import io
 import re
 import sqlite3
 import hashlib
+import unicodedata
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import openpyxl
 from rapidfuzz import fuzz, process
-import unicodedata
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="PriceBot PRO Cloud", layout="wide")
+st.set_page_config(page_title="PriceBot PRO V4", layout="wide")
 
-# Função para normalizar texto (remove acentos e padroniza)
 def normalizar(txt):
     if not txt: return ""
     txt = str(txt).lower().strip()
-    return "".join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
+    # Remove acentos (Transforma Água em Agua)
+    txt = "".join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
+    return txt
+
+def extrair_detalhes(texto):
+    if not texto: return set()
+    # Padroniza 1,5kg -> 1.5kg e remove espaços
+    texto = normalizar(texto).replace(',', '.')
+    texto = re.sub(r'(\d+)\s+(g|kg|l|ml|lt|und|mts)', r'\1\2', texto)
+    padrao = r'(\d+(?:\.\d+)?\s?(?:g|gr|kg|l|lt|ml|mts|und)\b)'
+    return set(re.findall(padrao, texto))
 
 # --- BANCO DE DADOS ---
 DB_NAME = "data_master.db"
@@ -25,157 +34,134 @@ DB_NAME = "data_master.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS products 
-                 (description TEXT, barcode TEXT, price REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (username TEXT PRIMARY KEY, password TEXT, expiry TEXT, role TEXT)''')
-    c.execute("SELECT * FROM users WHERE username='admin'")
-    if not c.fetchone():
-        pw_hash = hashlib.sha256("admin123".encode()).hexdigest()
-        c.execute("INSERT INTO users VALUES (?, ?, ?, ?)", ('admin', pw_hash, '2099-12-31', 'admin'))
+    c.execute('''CREATE TABLE IF NOT EXISTS products (description TEXT, barcode TEXT, price REAL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, expiry TEXT, role TEXT)''')
+    if not c.execute("SELECT * FROM users WHERE username='admin'").fetchone():
+        pw = hashlib.sha256("admin123".encode()).hexdigest()
+        c.execute("INSERT INTO users VALUES (?, ?, ?, ?)", ('admin', pw, '2099-12-31', 'admin'))
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- FUNÇÕES DE APOIO ---
-def extrair_detalhes(texto):
-    if not texto: return set()
-    texto = normalizar(texto).replace(',', '.')
-    padrao = r'(\d+(?:\.\d+)?\s?(?:g|gr|kg|l|lt|ml|mts|und)\b)'
-    return set(re.findall(padrao, texto))
-
-def extra_round(valor):
-    return float(Decimal(str(valor)).quantize(Decimal('0.00'), rounding=ROUND_HALF_UP))
-
 # --- LOGIN ---
-if 'autenticado' not in st.session_state:
-    st.session_state.autenticado = False
+if 'auth' not in st.session_state: st.session_state.auth = False
 
-if not st.session_state.autenticado:
-    st.sidebar.title("🔐 Acesso")
-    u = st.sidebar.text_input("Usuário")
-    p = st.sidebar.text_input("Senha", type="password")
+if not st.session_state.auth:
+    st.sidebar.title("🔐 Login")
+    u, p = st.sidebar.text_input("Usuário"), st.sidebar.text_input("Senha", type="password")
     if st.sidebar.button("Entrar"):
         conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        pw_h = hashlib.sha256(p.encode()).hexdigest()
-        c.execute("SELECT role FROM users WHERE username=? AND password=?", (u, pw_h))
-        res = c.fetchone()
+        pw = hashlib.sha256(p.encode()).hexdigest()
+        res = conn.execute("SELECT role FROM users WHERE username=? AND password=?", (u, pw)).fetchone()
         if res:
-            st.session_state.autenticado = True
-            st.session_state.user_role = res[0]
+            st.session_state.auth = True
+            st.session_state.role = res[0]
             st.rerun()
-        else: st.sidebar.error("Dados incorretos")
+        else: st.sidebar.error("Usuário ou senha incorretos")
     st.stop()
 
-# --- INTERFACE PRINCIPAL ---
+# --- INTERFACE ---
 aba = st.sidebar.radio("Menu", ["📊 Cotação", "⚙️ Banco de Dados"])
 
 if aba == "📊 Cotação":
-    st.title("📊 Automatizador de Cotações")
+    st.title("📊 Automatizador de Cotações PRO")
 
-    # Carregar banco para a sessão para evitar perdas
+    # Carregar banco para evitar re-leitura constante
     if 'master_df' not in st.session_state:
         conn = sqlite3.connect(DB_NAME)
         st.session_state.master_df = pd.read_sql("SELECT * FROM products", conn)
         conn.close()
 
-    if st.session_state.master_df.empty:
-        st.info("O banco de dados está vazio. Vá em 'Banco de Dados' e envie seus preços.")
+    master_df = st.session_state.master_df
+
+    if master_df.empty:
+        st.warning("⚠️ O banco de dados está vazio! Importe dados na aba 'Banco de Dados'.")
         st.stop()
 
     with st.sidebar:
         st.header("Configurações")
-        modo = st.selectbox("Regra:", ["Híbrido (Recomendado)", "Apenas Barras", "Apenas Similaridade"])
-        sensibilidade = st.slider("Sensibilidade Match (%)", 50, 100, 75)
+        sensibilidade = st.slider("Sensibilidade Similaridade (%)", 50, 100, 75)
         discount = st.number_input("Desconto Global (%)", 0.0)
-        debug_mode = st.checkbox("Mostrar Log de Processamento (Debug)")
+        debug = st.checkbox("🔍 Modo Debug (Ver motivos de erro)")
 
-    file = st.file_uploader("Suba a planilha de cotação (XLSX)", type=["xlsx"])
+    file = st.file_uploader("Suba sua planilha de Cotação", type=["xlsx"])
 
     if file:
-        h_row = st.number_input("Linha do Cabeçalho (onde estão os nomes das colunas):", 1, 50, 1)
-        
-        # Leitura rápida para mapeamento
+        h_row = st.number_input("Linha do Cabeçalho:", 1, 50, 1)
         df_cols = pd.read_excel(file, header=h_row-1, nrows=0).columns.tolist()
-        col1, col2, col3 = st.columns(3)
-        d_col = col1.selectbox("Coluna Descrição", df_cols)
-        b_col = col2.selectbox("Coluna Barras", df_cols)
-        p_col = col3.selectbox("Coluna Preço", df_cols)
+        
+        c1, c2, c3 = st.columns(3)
+        d_col = c1.selectbox("Coluna Descrição", df_cols)
+        b_col = c2.selectbox("Coluna Barras", df_cols)
+        p_col = c3.selectbox("Coluna Preço", df_cols)
 
-        if st.button("🚀 Iniciar"):
-            # Preparar dados
-            master = st.session_state.master_df
-            price_map = dict(zip(master['barcode'].astype(str), master['price']))
-            # Criamos uma lista de descrições normalizadas para comparação justa
-            db_descs_norm = [normalizar(d) for d in master['description']]
+        if st.button("🚀 Iniciar Processamento"):
+            price_map = dict(zip(master_df['barcode'].astype(str), master_df['price']))
+            db_descs_norm = [normalizar(d) for d in master_df['description']]
             
             wb = openpyxl.load_workbook(file)
             ws = wb.active
             
-            # Mapear índices (A=1, B=2...)
+            # Mapeamento de colunas
             header_map = {str(ws.cell(row=h_row, column=i).value).strip(): i for i in range(1, ws.max_column + 1)}
             idx_d, idx_b, idx_p = header_map[d_col], header_map[b_col], header_map[p_col]
 
             count = 0
-            log_debug = []
+            logs = []
 
             for r in range(h_row + 1, ws.max_row + 1):
                 desc_orig = str(ws.cell(row=r, column=idx_d).value or "")
-                desc_target = normalizar(desc_orig)
-                bar_target = str(ws.cell(row=r, column=idx_b).value or "").split('.')[0]
+                desc_norm = normalizar(desc_orig)
+                bar_orig = str(ws.cell(row=r, column=idx_b).value or "").split('.')[0]
                 
                 found_p = None
-                reason = "Não encontrado"
+                status = "Não localizado"
 
-                # 1. Busca por Barras
-                if "Barras" in modo or "Híbrido" in modo:
-                    if bar_target in price_map:
-                        found_p = price_map[bar_target]
-                        reason = "Match por Barras"
-
-                # 2. Busca por Similaridade
-                if found_p is None and ("Similaridade" in modo or "Híbrido" in modo) and len(desc_target) > 3:
-                    alvo_detalhes = extrair_detalhes(desc_orig)
+                # 1. TENTA POR BARRAS (Prioridade 100%)
+                if bar_orig in price_map:
+                    found_p = price_map[bar_orig]
+                    status = "Match: Código de Barras"
+                
+                # 2. TENTA POR SIMILARIDADE (OLHA O TOP 5 CANDIDATOS)
+                if found_p is None and len(desc_norm) > 3:
+                    alvo_pesos = extrair_detalhes(desc_orig)
                     
-                    # WRatio é melhor para frases curtas e palavras fora de ordem
-                    res = process.extractOne(desc_target, db_descs_norm, scorer=fuzz.WRatio)
+                    # Busca os 5 melhores matches no banco
+                    matches = process.extract(desc_norm, db_descs_norm, scorer=fuzz.token_set_ratio, limit=5)
                     
-                    if res and res[1] >= sensibilidade:
-                        match_text_norm, score, idx = res
-                        db_item = master.iloc[idx]
-                        db_detalhes = extrair_detalhes(db_item['description'])
-                        
-                        # Verifica se as medidas (kg, ml) batem
-                        if not alvo_detalhes or not db_detalhes or alvo_detalhes == db_detalhes:
-                            found_p = db_item['price']
-                            reason = f"Similaridade: {score}%"
-                        else:
-                            reason = f"Conflito de Peso ({alvo_detalhes} vs {db_detalhes})"
+                    for m_text_norm, score, m_idx in matches:
+                        if score >= sensibilidade:
+                            db_item = master_df.iloc[m_idx]
+                            db_pesos = extrair_detalhes(db_item['description'])
+                            
+                            # VALIDAÇÃO: Só aceita se os pesos forem iguais OU se um deles não tiver peso
+                            if not alvo_pesos or not db_pesos or alvo_pesos == db_pesos:
+                                found_p = db_item['price']
+                                status = f"Match: {score}% similaridade"
+                                break
+                            else:
+                                status = f"Bloqueado: Peso Divergente ({alvo_pesos} vs {db_pesos})"
 
                 if found_p:
-                    final_v = float(found_p) * (1 - (discount/100))
-                    ws.cell(row=r, column=idx_p).value = extra_round(final_v)
+                    final_p = float(found_p) * (1 - (discount/100))
+                    ws.cell(row=r, column=idx_p).value = round(final_p, 2)
                     count += 1
                 
-                if debug_mode: log_debug.append({"Linha": r, "Produto": desc_orig, "Resultado": reason})
+                if debug: logs.append({"Linha": r, "Produto": desc_orig, "Status": status})
 
             output = io.BytesIO()
             wb.save(output)
-            st.success(f"Sucesso! {count} itens atualizados.")
-            st.download_button("📥 Baixar Resultado", output.getvalue(), "resultado.xlsx")
-            
-            if debug_mode:
-                st.write("### Relatório de Debug")
-                st.table(log_debug)
+            st.success(f"Finalizado! {count} preços preenchidos.")
+            st.download_button("📥 Baixar Planilha Pronta", output.getvalue(), "cotacao_final.xlsx")
+            if debug: st.table(logs)
 
 elif aba == "⚙️ Banco de Dados":
-    st.title("⚙️ Gerenciar Preços")
-    f_db = st.file_uploader("Upload Banco de Dados (Descrição, Barras, Preço)", type=["xlsx", "csv"])
-    replace = st.checkbox("Substituir dados antigos?")
+    st.title("⚙️ Gestão de Preços Mestre")
+    f_db = st.file_uploader("Upload Banco (Coluna 1: Desc, 2: Barras, 3: Preço)", type=["xlsx", "csv"])
+    replace = st.checkbox("Substituir banco atual?")
     
-    if f_db and st.button("💾 Sincronizar"):
+    if f_db and st.button("💾 Sincronizar Banco"):
         df = pd.read_excel(f_db) if f_db.name.endswith('.xlsx') else pd.read_csv(f_db)
         df = df.iloc[:, [0, 1, 2]]
         df.columns = ['description', 'barcode', 'price']
@@ -185,6 +171,6 @@ elif aba == "⚙️ Banco de Dados":
         df.to_sql("products", conn, if_exists="replace" if replace else "append", index=False)
         conn.close()
         
-        # Forçar atualização da sessão
-        st.session_state.pop('master_df', None)
-        st.success("Banco de dados atualizado com sucesso!")
+        # Limpa cache da sessão
+        if 'master_df' in st.session_state: del st.session_state['master_df']
+        st.success("Banco de Dados sincronizado com sucesso!")
