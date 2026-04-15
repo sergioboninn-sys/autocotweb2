@@ -5,33 +5,34 @@ import re
 import sqlite3
 import hashlib
 import unicodedata
-from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import openpyxl
 from rapidfuzz import fuzz, process
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Sistema de Cotação Inteligente V4.1", layout="wide")
+st.set_page_config(page_title="PriceBot PRO V4.2", layout="wide")
 
-# --- FUNÇÕES DE TRATAMENTO ---
+# --- FUNÇÕES DE APOIO ---
 def normalizar(txt):
     if not txt: return ""
     txt = str(txt).lower().strip()
+    # Remove acentos para a similaridade funcionar bem
     txt = "".join(c for c in unicodedata.normalize('NFD', txt) if unicodedata.category(c) != 'Mn')
     return txt
 
 def extrair_detalhes(texto):
     if not texto: return set()
     texto = normalizar(texto).replace(',', '.')
+    # Padroniza medidas para evitar erro de 1kg vs 1 kg
     texto = re.sub(r'(\d+)\s+(g|kg|l|ml|lt|und|mts)', r'\1\2', texto)
     padrao = r'(\d+(?:\.\d+)?\s?(?:g|gr|kg|l|lt|ml|mts|und)\b)'
     return set(re.findall(padrao, texto))
 
-def limpar_barcode(val):
-    if pd.isna(val) or val == "" or str(val).strip() == "":
-        return ""
-    s = str(val).split('.')[0]
-    return re.sub(r'\D', '', s)
+# --- REGRA DE BARRAS ORIGINAL (COMO NO SEU 1º CÓDIGO) ---
+def limpar_barcode_original(val):
+    if pd.isna(val): return ""
+    # Apenas remove o .0 e converte pra string (Exatamente como você fazia)
+    return str(val).split('.')[0]
 
 # --- BANCO DE DADOS ---
 DB_NAME = "data_master.db"
@@ -61,9 +62,8 @@ if not st.session_state.auth:
         res = conn.execute("SELECT role FROM users WHERE username=? AND password=?", (u, pw)).fetchone()
         if res:
             st.session_state.auth = True
-            st.session_state.role = res[0]
             st.rerun()
-        else: st.sidebar.error("Incorreto")
+        else: st.sidebar.error("Dados incorretos")
     st.stop()
 
 # --- INTERFACE ---
@@ -78,18 +78,13 @@ if menu == "📊 Processar Cotação":
         conn.close()
 
     master_df = st.session_state.master_df
-    if master_df.empty:
-        st.warning("Banco vazio!")
-        st.stop()
 
     with st.sidebar:
-        st.header("Configurações de Busca")
-        # --- OPÇÕES RESTAURADAS NO LAYOUT ---
+        st.header("Configurações")
         modo_busca = st.selectbox("Escolha a regra:", 
                                  ["Híbrido (Barras + Similaridade)", 
                                   "Apenas Código de Barras", 
                                   "Apenas Similaridade"])
-        
         sensibilidade = st.slider("Sensibilidade Similaridade (%)", 50, 100, 75)
         desconto = st.number_input("Desconto Global (%)", 0.0)
         debug = st.checkbox("🔍 Modo Debug")
@@ -97,7 +92,7 @@ if menu == "📊 Processar Cotação":
     file = st.file_uploader("Upload da Cotação", type=["xlsx"])
 
     if file:
-        h_row = st.number_input("Linha do Cabeçalho:", 1, 100, 1)
+        h_row = st.number_input("Linha do Cabeçalho:", 1, 100, 10) # Padrão 10 como no seu original
         df_cols = pd.read_excel(file, header=h_row-1, nrows=0).columns.tolist()
         
         c1, c2, c3 = st.columns(3)
@@ -106,6 +101,7 @@ if menu == "📊 Processar Cotação":
         col_price = c3.selectbox("Coluna Preço", df_cols)
 
         if st.button("🚀 Iniciar Processamento"):
+            # Mapeamento do banco
             price_map = dict(zip(master_df['barcode'].astype(str), master_df['price']))
             db_descs_norm = [normalizar(d) for d in master_df['description']]
             
@@ -119,18 +115,19 @@ if menu == "📊 Processar Cotação":
             for r in range(h_row + 1, ws.max_row + 1):
                 orig_desc = str(ws.cell(row=r, column=idx_d).value or "")
                 norm_desc = normalizar(orig_desc)
-                orig_bar = limpar_barcode(ws.cell(row=r, column=idx_b).value)
+                # USA A REGRA ORIGINAL DE BARRAS
+                orig_bar = limpar_barcode_original(ws.cell(row=r, column=idx_b).value)
                 
                 found_p = None
                 status = "Não encontrado"
 
-                # 1. LOGICA DE BARRAS
+                # 1. BUSCA POR BARRAS (REGRA ORIGINAL)
                 if "Barras" in modo_busca or "Híbrido" in modo_busca:
-                    if orig_bar and orig_bar in price_map:
+                    if orig_bar in price_map:
                         found_p = price_map[orig_bar]
                         status = "Match: Código de Barras"
 
-                # 2. LOGICA DE SIMILARIDADE (Se não achou por barras ou se for modo similaridade)
+                # 2. BUSCA POR SIMILARIDADE (REGRA NOVA TOP 5)
                 if found_p is None and ("Similaridade" in modo_busca or "Híbrido" in modo_busca) and len(norm_desc) > 3:
                     alvo_pesos = extrair_detalhes(orig_desc)
                     matches = process.extract(norm_desc, db_descs_norm, scorer=fuzz.token_set_ratio, limit=5)
@@ -145,7 +142,7 @@ if menu == "📊 Processar Cotação":
                                 status = f"Match: {score}% similar"
                                 break
                             else:
-                                status = f"Bloqueado: Peso {alvo_pesos} vs {db_pesos}"
+                                status = f"Bloqueado: Peso Divergente"
 
                 if found_p:
                     v_final = float(found_p) * (1 - (desconto/100))
@@ -157,7 +154,7 @@ if menu == "📊 Processar Cotação":
             output = io.BytesIO()
             wb.save(output)
             st.success(f"Finalizado! {count} itens processados.")
-            st.download_button("📥 Baixar Planilha", output.getvalue(), "cotacao_final.xlsx")
+            st.download_button("📥 Baixar Planilha", output.getvalue(), "cotacao_finalizada.xlsx")
             if debug: st.table(logs)
 
 elif menu == "⚙️ Gerenciar Banco":
@@ -165,15 +162,14 @@ elif menu == "⚙️ Gerenciar Banco":
     f_db = st.file_uploader("Upload Banco", type=["xlsx", "csv"])
     sub = st.checkbox("Substituir tudo?")
     if f_db and st.button("💾 Sincronizar"):
-        try:
-            df = pd.read_excel(f_db) if f_db.name.endswith('.xlsx') else pd.read_csv(f_db)
-            df = df.iloc[:, [0, 1, 2]]
-            df.columns = ['description', 'barcode', 'price']
-            df['barcode'] = df['barcode'].apply(limpar_barcode)
-            df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
-            conn = sqlite3.connect(DB_NAME)
-            df.to_sql("products", conn, if_exists="replace" if sub else "append", index=False)
-            conn.close()
-            if 'master_df' in st.session_state: del st.session_state['master_df']
-            st.success("Banco Atualizado!")
-        except Exception as e: st.error(f"Erro: {e}")
+        df = pd.read_excel(f_db) if f_db.name.endswith('.xlsx') else pd.read_csv(f_db)
+        df = df.iloc[:, [0, 1, 2]]
+        df.columns = ['description', 'barcode', 'price']
+        # TAMBÉM APLICA A REGRA ORIGINAL NA IMPORTAÇÃO
+        df['barcode'] = df['barcode'].apply(limpar_barcode_original)
+        df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
+        conn = sqlite3.connect(DB_NAME)
+        df.to_sql("products", conn, if_exists="replace" if sub else "append", index=False)
+        conn.close()
+        if 'master_df' in st.session_state: del st.session_state['master_df']
+        st.success("Banco Atualizado!")
