@@ -6,12 +6,13 @@ import sqlite3
 import hashlib
 import unicodedata
 import openpyxl
+from datetime import datetime, timedelta
 from rapidfuzz import fuzz, process
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="PriceBot PRO V4.4", layout="wide")
+st.set_page_config(page_title="PriceBot PRO V4.5", layout="wide")
 
-# --- FUNÇÕES DE APOIO (SIMILARIDADE) ---
+# --- FUNÇÕES DE APOIO ---
 def normalizar(txt):
     if not txt: return ""
     txt = str(txt).lower().strip()
@@ -23,47 +24,62 @@ def extrair_detalhes(texto):
     texto = str(texto).lower()
     return set(re.findall(r'(\d+\s?(?:g|gr|kg|l|lt|ml)\b)', texto))
 
-# --- REGRA DE BARRAS EXATA DO SEU 1º CÓDIGO ---
+# --- REGRA DE BARRAS ORIGINAL ---
 def extract_all_barcodes(val):
-    """Extrai blocos numéricos de 8 a 14 dígitos (Exatamente como o seu original)."""
     if pd.isna(val): return []
     return re.findall(r'\d{8,14}', str(val))
 
-# --- BANCO DE DADOS ---
+# --- BANCO DE DADOS (USUÁRIOS E PRODUTOS) ---
 DB_NAME = "data_master.db"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS products (description TEXT, barcode TEXT, price REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, expiry TEXT, role TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users 
+                 (username TEXT PRIMARY KEY, password TEXT, expiry TEXT, role TEXT)''')
+    
+    # Criar admin padrão se não existir
     if not c.execute("SELECT * FROM users WHERE username='admin'").fetchone():
         pw = hashlib.sha256("admin123".encode()).hexdigest()
-        c.execute("INSERT INTO users VALUES (?, ?, ?, ?)", ('admin', pw, '2099-12-31', 'admin'))
+        c.execute("INSERT INTO users VALUES (?, ?, ?, ?)", 
+                  ('admin', pw, '2099-12-31', 'admin'))
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- LOGIN ---
+# --- SISTEMA DE LOGIN ---
 if 'auth' not in st.session_state: st.session_state.auth = False
 
 if not st.session_state.auth:
-    st.sidebar.title("🔐 Acesso")
-    u, p = st.sidebar.text_input("Usuário"), st.sidebar.text_input("Senha", type="password")
+    st.sidebar.title("🔐 Acesso ao Sistema")
+    u = st.sidebar.text_input("Usuário")
+    p = st.sidebar.text_input("Senha", type="password")
     if st.sidebar.button("Entrar"):
         conn = sqlite3.connect(DB_NAME)
         pw = hashlib.sha256(p.encode()).hexdigest()
-        res = conn.execute("SELECT role FROM users WHERE username=? AND password=?", (u, pw)).fetchone()
+        res = conn.execute("SELECT role, expiry FROM users WHERE username=? AND password=?", (u, pw)).fetchone()
+        conn.close()
         if res:
-            st.session_state.auth = True
-            st.rerun()
-        else: st.sidebar.error("Dados incorretos")
+            exp_date = datetime.strptime(res[1], '%Y-%m-%d')
+            if datetime.now() <= exp_date:
+                st.session_state.auth = True
+                st.session_state.username = u
+                st.session_state.role = res[0]
+                st.rerun()
+            else: st.sidebar.error("Sua senha expirou!")
+        else: st.sidebar.error("Usuário ou senha incorretos")
     st.stop()
 
-# --- INTERFACE ---
-menu = st.sidebar.radio("Navegação", ["📊 Processar Cotação", "⚙️ Gerenciar Banco"])
+# --- MENU DE NAVEGAÇÃO ---
+opcoes = ["📊 Processar Cotação", "⚙️ Gerenciar Banco"]
+if st.session_state.role == 'admin':
+    opcoes.append("👑 Painel Administrativo")
 
+menu = st.sidebar.radio("Navegação", opcoes)
+
+# --- ABA 1: COTAÇÃO ---
 if menu == "📊 Processar Cotação":
     st.title("📊 Automatizador de Cotações PRO")
 
@@ -95,7 +111,6 @@ if menu == "📊 Processar Cotação":
         col_price = c3.selectbox("Coluna Preço", df_dest.columns)
 
         if st.button("🚀 INICIAR PROCESSAMENTO"):
-            # Lógica de mapeamento idêntica à original
             price_map = dict(zip(master_df['barcode'].astype(str), master_df['price']))
             db_descs_norm = [normalizar(d) for d in master_df['description']]
             
@@ -108,10 +123,8 @@ if menu == "📊 Processar Cotação":
             for r in range(h_row + 1, ws.max_row + 1):
                 orig_desc = str(ws.cell(row=r, column=idx_d).value or "")
                 norm_desc = normalizar(orig_desc)
-                
                 found_p = None
 
-                # 1. BUSCA POR BARRAS (REGRA ORIGINAL DO SEU CÓDIGO)
                 if "Barras" in modo_busca or "Híbrido" in modo_busca:
                     bcs = extract_all_barcodes(ws.cell(row=r, column=idx_b).value)
                     for b in bcs:
@@ -119,16 +132,13 @@ if menu == "📊 Processar Cotação":
                             found_p = price_map[b]
                             break
 
-                # 2. BUSCA POR SIMILARIDADE (MANTENDO A MELHORIA DO TOP 5)
                 if found_p is None and ("Similaridade" in modo_busca or "Híbrido" in modo_busca) and len(norm_desc) > 3:
                     alvo_pesos = extrair_detalhes(orig_desc)
                     matches = process.extract(norm_desc, db_descs_norm, scorer=fuzz.token_set_ratio, limit=5)
-                    
                     for m_text, score, m_idx in matches:
                         if score >= sensibilidade:
                             item_db = master_df.iloc[m_idx]
                             db_pesos = extrair_detalhes(item_db['description'])
-                            
                             if not alvo_pesos or not db_pesos or alvo_pesos == db_pesos:
                                 found_p = item_db['price']
                                 break
@@ -143,6 +153,7 @@ if menu == "📊 Processar Cotação":
             st.success(f"Finalizado! {count} itens processados.")
             st.download_button("📥 Baixar Planilha", output.getvalue(), "cotacao_finalizada.xlsx")
 
+# --- ABA 2: BANCO ---
 elif menu == "⚙️ Gerenciar Banco":
     st.title("⚙️ Gerenciar Banco de Dados")
     f_db = st.file_uploader("Upload Banco", type=["xlsx", "csv"])
@@ -151,12 +162,38 @@ elif menu == "⚙️ Gerenciar Banco":
         df = pd.read_excel(f_db) if f_db.name.endswith('.xlsx') else pd.read_csv(f_db)
         df = df.iloc[:, [0, 1, 2]]
         df.columns = ['description', 'barcode', 'price']
-        
-        # Tratamento de barras na importação conforme seu original
         df['barcode'] = df['barcode'].apply(lambda x: re.sub(r'\D', '', str(x).split('.')[0]))
-        
         conn = sqlite3.connect(DB_NAME)
         df.to_sql("products", conn, if_exists="replace" if sub else "append", index=False)
         conn.close()
         if 'master_df' in st.session_state: del st.session_state['master_df']
-        st.success("Banco Atualizado!")
+        st.success("Banco de Dados Atualizado!")
+
+# --- ABA 3: ADMINISTRAÇÃO (RESTAURADA) ---
+elif menu == "👑 Painel Administrativo":
+    st.title("👑 Gestão de Usuários")
+    
+    with st.expander("➕ Criar Novo Usuário"):
+        new_u = st.text_input("Nome do Usuário")
+        new_p = st.text_input("Senha", type="password", key="new_p")
+        validade = st.number_input("Validade da Senha (Dias)", min_value=1, value=30)
+        
+        if st.button("Confirmar Criação"):
+            if new_u and new_p:
+                conn = sqlite3.connect(DB_NAME)
+                c = conn.cursor()
+                pw_h = hashlib.sha256(new_p.encode()).hexdigest()
+                exp = (datetime.now() + timedelta(days=validade)).strftime('%Y-%m-%d')
+                try:
+                    c.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (new_u, pw_h, exp, 'user'))
+                    conn.commit()
+                    st.success(f"Usuário {new_u} criado com sucesso! Válido até {exp}")
+                except: st.error("Usuário já existe!")
+                conn.close()
+            else: st.warning("Preencha todos os campos.")
+
+    st.subheader("👥 Usuários Cadastrados")
+    conn = sqlite3.connect(DB_NAME)
+    usuarios_df = pd.read_sql("SELECT username, expiry, role FROM users", conn)
+    conn.close()
+    st.dataframe(usuarios_df, use_container_width=True)
