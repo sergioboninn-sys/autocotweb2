@@ -9,9 +9,9 @@ import openpyxl
 from rapidfuzz import fuzz, process
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="PriceBot PRO V4.3", layout="wide")
+st.set_page_config(page_title="PriceBot PRO V4.4", layout="wide")
 
-# --- FUNÇÕES DE APOIO ---
+# --- FUNÇÕES DE APOIO (SIMILARIDADE) ---
 def normalizar(txt):
     if not txt: return ""
     txt = str(txt).lower().strip()
@@ -20,16 +20,14 @@ def normalizar(txt):
 
 def extrair_detalhes(texto):
     if not texto: return set()
-    texto = normalizar(texto).replace(',', '.')
-    texto = re.sub(r'(\d+)\s+(g|kg|l|ml|lt|und|mts)', r'\1\2', texto)
-    padrao = r'(\d+(?:\.\d+)?\s?(?:g|gr|kg|l|lt|ml|mts|und)\b)'
-    return set(re.findall(padrao, texto))
+    texto = str(texto).lower()
+    return set(re.findall(r'(\d+\s?(?:g|gr|kg|l|lt|ml)\b)', texto))
 
-# --- REGRA DE BARRAS FIEL AO SEU ORIGINAL ---
-def limpar_barcode_original(val):
-    if pd.isna(val) or val == "": return ""
-    # Converte para string, remove espaços e corta o .0 do Excel
-    return str(val).strip().split('.')[0]
+# --- REGRA DE BARRAS EXATA DO SEU 1º CÓDIGO ---
+def extract_all_barcodes(val):
+    """Extrai blocos numéricos de 8 a 14 dígitos (Exatamente como o seu original)."""
+    if pd.isna(val): return []
+    return re.findall(r'\d{8,14}', str(val))
 
 # --- BANCO DE DADOS ---
 DB_NAME = "data_master.db"
@@ -84,7 +82,6 @@ if menu == "📊 Processar Cotação":
                                   "Apenas Similaridade"])
         sensibilidade = st.slider("Sensibilidade Similaridade (%)", 50, 100, 75)
         desconto = st.number_input("Desconto Global (%)", 0.0)
-        debug = st.checkbox("🔍 Modo Debug")
 
     file = st.file_uploader("Upload da Cotação", type=["xlsx"])
 
@@ -97,36 +94,32 @@ if menu == "📊 Processar Cotação":
         col_bar = c2.selectbox("Coluna Cód. Barras", df_dest.columns)
         col_price = c3.selectbox("Coluna Preço", df_dest.columns)
 
-        if st.button("🚀 Iniciar Processamento"):
-            # CRÍTICO: Garantir que as chaves do dicionário sejam strings limpas
-            price_map = {str(b).strip().split('.')[0]: p for b, p in zip(master_df['barcode'], master_df['price'])}
+        if st.button("🚀 INICIAR PROCESSAMENTO"):
+            # Lógica de mapeamento idêntica à original
+            price_map = dict(zip(master_df['barcode'].astype(str), master_df['price']))
             db_descs_norm = [normalizar(d) for d in master_df['description']]
             
             wb = openpyxl.load_workbook(file)
             ws = wb.active
-            
-            # Mapeamento de colunas pelo nome selecionado
             header_map = {str(ws.cell(row=h_row, column=i).value).strip(): i for i in range(1, ws.max_column + 1)}
             idx_d, idx_b, idx_p = header_map[col_desc], header_map[col_bar], header_map[col_price]
 
-            count, logs = 0, []
-
+            count = 0
             for r in range(h_row + 1, ws.max_row + 1):
                 orig_desc = str(ws.cell(row=r, column=idx_d).value or "")
                 norm_desc = normalizar(orig_desc)
-                # Chamada da regra de barras original
-                orig_bar = limpar_barcode_original(ws.cell(row=r, column=idx_b).value)
                 
                 found_p = None
-                status = "Não encontrado"
 
-                # 1. BUSCA POR BARRAS
+                # 1. BUSCA POR BARRAS (REGRA ORIGINAL DO SEU CÓDIGO)
                 if "Barras" in modo_busca or "Híbrido" in modo_busca:
-                    if orig_bar and orig_bar in price_map:
-                        found_p = price_map[orig_bar]
-                        status = "Match: Código de Barras"
+                    bcs = extract_all_barcodes(ws.cell(row=r, column=idx_b).value)
+                    for b in bcs:
+                        if b in price_map:
+                            found_p = price_map[b]
+                            break
 
-                # 2. BUSCA POR SIMILARIDADE (NOVA REGRA TOP 5)
+                # 2. BUSCA POR SIMILARIDADE (MANTENDO A MELHORIA DO TOP 5)
                 if found_p is None and ("Similaridade" in modo_busca or "Híbrido" in modo_busca) and len(norm_desc) > 3:
                     alvo_pesos = extrair_detalhes(orig_desc)
                     matches = process.extract(norm_desc, db_descs_norm, scorer=fuzz.token_set_ratio, limit=5)
@@ -138,23 +131,17 @@ if menu == "📊 Processar Cotação":
                             
                             if not alvo_pesos or not db_pesos or alvo_pesos == db_pesos:
                                 found_p = item_db['price']
-                                status = f"Match: {score}% similar"
                                 break
-                            else:
-                                status = f"Bloqueado: Peso Divergente"
 
                 if found_p:
                     v_final = float(found_p) * (1 - (desconto/100))
                     ws.cell(row=r, column=idx_p).value = round(v_final, 2)
                     count += 1
-                
-                if debug: logs.append({"Linha": r, "Produto": orig_desc, "Lido_Bar": orig_bar, "Status": status})
 
             output = io.BytesIO()
             wb.save(output)
             st.success(f"Finalizado! {count} itens processados.")
             st.download_button("📥 Baixar Planilha", output.getvalue(), "cotacao_finalizada.xlsx")
-            if debug: st.table(logs)
 
 elif menu == "⚙️ Gerenciar Banco":
     st.title("⚙️ Gerenciar Banco de Dados")
@@ -164,9 +151,10 @@ elif menu == "⚙️ Gerenciar Banco":
         df = pd.read_excel(f_db) if f_db.name.endswith('.xlsx') else pd.read_csv(f_db)
         df = df.iloc[:, [0, 1, 2]]
         df.columns = ['description', 'barcode', 'price']
-        # Importante: limpar barras na entrada também
-        df['barcode'] = df['barcode'].apply(limpar_barcode_original)
-        df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
+        
+        # Tratamento de barras na importação conforme seu original
+        df['barcode'] = df['barcode'].apply(lambda x: re.sub(r'\D', '', str(x).split('.')[0]))
+        
         conn = sqlite3.connect(DB_NAME)
         df.to_sql("products", conn, if_exists="replace" if sub else "append", index=False)
         conn.close()
